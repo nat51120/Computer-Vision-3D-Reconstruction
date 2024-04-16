@@ -15,7 +15,7 @@ Install following packages via pip:
 
 If you have errors after installation you will do following:
 1. `pip uninstall PyOpenGL PyOpenGL_accelerate`
-2. Download and install PyOpenGL and PyOpenGL_accelerate from https://www.lfd.uci.edu/~gohlke/pythonlibs/
+2. Download and install PyOpenGL and PyOpenGL_accelerate from [https://www.lfd.uci.edu/~gohlke/pythonlibs/](https://pyopengl.sourceforge.net/documentation/installation.html)
 
 ## Control
 ```
