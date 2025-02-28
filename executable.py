@@ -9,6 +9,7 @@ from engine.effect.bloom import Bloom
 from assignment import set_voxel_positions, generate_grid, get_cam_positions, get_cam_rotation_matrices
 from engine.camera import Camera
 from engine.config import config
+from assignment import set_voxel_positions, generate_grid, get_cam_positions, get_cam_rotation_matrices, calibrate_cameras
 
 cube, hdrbuffer, blurbuffer, lastPosX, lastPosY = None, None, None, None, None
 firstTime = True
@@ -45,6 +46,11 @@ def draw_objs(obj, program, perspective, light_pos, texture, normal, specular, d
 
 def main():
     global hdrbuffer, blurbuffer, cube, window_width, window_height
+    # First, perform calibration
+    data_path = "data"
+    camera_folders = ["cam1", "cam2", "cam3", "cam4"]
+    cam_calib = calibrate_cameras(data_path, camera_folders, num_frames=25)
+    # cam_calib is a dictionary containing each camera's calibration data
 
     if not glfw.init():
         print('Failed to initialize GLFW.')
