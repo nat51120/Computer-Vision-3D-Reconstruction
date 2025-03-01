@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<opencv_storage>
+  <Extrinsics type_id="opencv-matrix">
+    <rows>9</rows>
+    <cols>7</cols>
+    <dt>f</dt>
+    <data>
+      0.12119338 0.14416855 0.03913568 -523.95380330 115.00906562 1615.20326455
+    </data>
+  </Extrinsics>
+</opencv_storage>
