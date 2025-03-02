@@ -52,7 +52,7 @@ def calibrate_cameras(data_path, camera_folders, num_frames=25):
     return cam_params
 
 # Function that calculates the extrinsics for a camera based on the chessboard.avi video frame
-def calibrate_extrinsics_for_camera(cam_folder, intrinsics, calib_video="ch1.avi"):
+def calibrate_extrinsics_for_camera(cam_folder, intrinsics, calib_video="checkerboard.avi"):
     cameraMatrix = intrinsics["cameraMatrix"]
     distCoeffs = intrinsics["distCoeffs"]
     
