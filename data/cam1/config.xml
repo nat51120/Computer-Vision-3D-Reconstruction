@@ -27,9 +27,9 @@
     <cols>1</cols>
     <dt>f</dt>
     <data>
-      0.12119338
-      0.14416855
-      0.03913568
+      -1.52034406
+      0.55617857
+      0.54655366
     </data>
   </RotationVector>
   <TranslationVector type_id="opencv-matrix">
@@ -37,9 +37,9 @@
     <cols>1</cols>
     <dt>f</dt>
     <data>
-      -523.95380330
-      115.00906562
-      1615.20326455
+      -28.12723153
+      1591.13039302
+      4872.95123225
     </data>
   </TranslationVector>
 </opencv_storage>
