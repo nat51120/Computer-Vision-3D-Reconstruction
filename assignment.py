@@ -191,7 +191,7 @@ def create_config_xml(cameraMatrix, distCoeffs, rvec, tvec):
     return xml
 
 # Function that determined whether calibration is needed
-def run_calibration_interface(data_path, camera_folders, num_frames=1, calib_video="checkerboard.avi"):
+def run_calibration_interface(data_path, camera_folders, num_frames=25, calib_video="checkerboard.avi"):
     full_calib = {}
     missing = []
     for cam in camera_folders:
