@@ -4,7 +4,7 @@ import numpy as np
 import cv2
 import os
 
-from calibration import extract_frames, get_manual_corners, interpolate_with_homography, determine_grid_size, calibrate_camera, inner_objp, square_size
+from calibration import extract_frames, get_manual_corners, interpolate_with_homography, determine_grid_size, calibrate_camera, inner_objp, reorder_corners, square_size
 from background_subtraction import build_background_model_mog2, get_foreground_mask
 
 block_size = 1.0
@@ -47,12 +47,192 @@ def calibrate_cameras(data_path, camera_folders, num_frames=25):
         print(f"[Camera: {cam}] Calibration complete. Mean Error: {err}")
         cam_params[cam] = {
             "cameraMatrix": camMat,
-            "distCoeffs": distCoeffs,
-            "rvec": rvecs[0],
-            "tvec": tvecs[0]
+            "distCoeffs": distCoeffs
         }
     return cam_params
 
+# Function that calculates the extrinsics for a camera based on the chessboard.avi video frame
+def calibrate_extrinsics_for_camera(cam_folder, intrinsics, calib_video="ch1.avi"):
+    cameraMatrix = intrinsics["cameraMatrix"]
+    distCoeffs = intrinsics["distCoeffs"]
+    
+    video_path = os.path.join("data", cam_folder, calib_video)
+    cap = cv2.VideoCapture(video_path)
+    ret, test_img = cap.read()
+    cap.release()
+    if not ret or test_img is None:
+        print(f"Error: Could not load a frame from {video_path}")
+        return None
+    
+    corners = get_manual_corners(test_img)
+    if not corners:
+        print(f"No corners selected for {cam_folder}; extrinsics calibration aborted.")
+        return None
+    ordered_corners = reorder_corners(corners)
+    grid_size = (10, 8)
+    full_grid = interpolate_with_homography(ordered_corners, grid_size)
+    inner_grid = full_grid[1:-1, 1:-1, :].reshape(-1, 2)
+    image_points = inner_grid.reshape(-1, 1, 2).astype(np.float32)
+    
+    success, rvec, tvec = cv2.solvePnP(inner_objp, image_points, cameraMatrix, distCoeffs)
+    if not success:
+        print(f"solvePnP failed for {cam_folder}")
+        return None
+    
+    projected, _ = cv2.projectPoints(inner_objp, rvec, tvec, cameraMatrix, distCoeffs)
+    error = np.mean(np.linalg.norm(image_points.reshape(-1,2) - projected.reshape(-1,2), axis=1))
+    print(f"[{cam_folder}] Extrinsics reprojection error: {error:.4f}")
+    print(f"[{cam_folder}] rvec:\n{rvec}\n tvec:\n{tvec}")
+
+    # Visualize by projecting a 3D axis.
+    axis_3D = np.float32([
+        [3 * square_size, 0, 0],
+        [0, 3 * square_size, 0],
+        [0, 0, -3 * square_size]
+    ])
+    imgpts, _ = cv2.projectPoints(axis_3D, rvec, tvec, cameraMatrix, distCoeffs)
+    corner_origin = tuple(map(int, inner_grid[0].ravel()))
+    x_axis = tuple(map(int, imgpts[0].ravel()))
+    y_axis = tuple(map(int, imgpts[1].ravel()))
+    z_axis = tuple(map(int, imgpts[2].ravel()))
+    overlay_img = test_img.copy()
+    cv2.line(overlay_img, corner_origin, x_axis, (255, 0, 0), 2)
+    cv2.line(overlay_img, corner_origin, y_axis, (0, 255, 0), 2)
+    cv2.line(overlay_img, corner_origin, z_axis, (0, 0, 255), 2)
+    cv2.namedWindow("3D Axes Overlay", cv2.WINDOW_NORMAL)
+    cv2.imshow("3D Axes Overlay", overlay_img)
+    cv2.waitKey(0)
+    cv2.destroyWindow("3D Axes Overlay")
+    
+    return {"rvec": rvec, "tvec": tvec}
+
+# Function that saves intrinsics and extrinsics for all cameras
+def calibrate_all_cameras(data_path, camera_folders, intrinsics_results, calib_video="checkerboard.avi"):
+    full_calib = {}
+    for cam in camera_folders:
+        if cam not in intrinsics_results:
+            print(f"Skipping {cam} because intrinsics were not computed.")
+            continue
+
+        print(f"\n--- Calibrating extrinsics for {cam} ---")
+        extrinsics = calibrate_extrinsics_for_camera(cam, intrinsics_results[cam], calib_video)
+        if extrinsics is None:
+            print(f"Extrinsics calibration for {cam} failed.")
+            continue
+
+        # Merge intrinsics and extrinsics for this camera
+        full_calib[cam] = {
+            "cameraMatrix": intrinsics_results[cam]["cameraMatrix"],
+            "distCoeffs": intrinsics_results[cam]["distCoeffs"],
+            "rvec": extrinsics["rvec"],
+            "tvec": extrinsics["tvec"]
+        }
+
+        # Create the XML string using your helper function.
+        xml_string = create_config_xml(
+            full_calib[cam]["cameraMatrix"],
+            full_calib[cam]["distCoeffs"],
+            full_calib[cam]["rvec"],
+            full_calib[cam]["tvec"]
+        )
+        # Save the XML file into the camera's folder
+        out_path = os.path.join(data_path, cam, "config.xml")
+        with open(out_path, "w") as f:
+            f.write(xml_string)
+        print(f"Calibration data for {cam} saved to {out_path}")
+
+    return full_calib
+
+# Function that creates xml files for the extrinsic and intrinsic values
+def create_config_xml(cameraMatrix, distCoeffs, rvec, tvec):
+    """
+    Creates an XML string in OpenCV format that stores the intrinsic and extrinsic parameters.
+    """
+    cm = cameraMatrix.flatten()
+    dc = distCoeffs.flatten()
+    rv = rvec.flatten()
+    tv = tvec.flatten()
+    xml = f"""<?xml version="1.0"?>
+    <opencv_storage>
+    <CameraMatrix type_id="opencv-matrix">
+        <rows>3</rows>
+        <cols>3</cols>
+        <dt>f</dt>
+        <data>
+        {" ".join([f"{x:.8f}" for x in cm])}
+        </data>
+    </CameraMatrix>
+    <DistortionCoeffs type_id="opencv-matrix">
+        <rows>5</rows>
+        <cols>1</cols>
+        <dt>f</dt>
+        <data>
+        {" ".join([f"{x:.8f}" for x in dc])}
+        </data>
+    </DistortionCoeffs>
+    <RotationVector type_id="opencv-matrix">
+        <rows>3</rows>
+        <cols>1</cols>
+        <dt>f</dt>
+        <data>
+        {" ".join([f"{x:.8f}" for x in rv])}
+        </data>
+    </RotationVector>
+    <TranslationVector type_id="opencv-matrix">
+        <rows>3</rows>
+        <cols>1</cols>
+        <dt>f</dt>
+        <data>
+        {" ".join([f"{x:.8f}" for x in tv])}
+        </data>
+    </TranslationVector>
+    </opencv_storage>
+    """
+    return xml
+
+# Function that determined whether calibration is needed
+def run_calibration_interface(data_path, camera_folders, num_frames=1, calib_video="checkerboard.avi"):
+    full_calib = {}
+    missing = []
+    for cam in camera_folders:
+        config_path = os.path.join(data_path, cam, "config.xml")
+        if not os.path.exists(config_path):
+            print(f"[{cam}] Config file not found. Calibration needed.")
+            missing.append(cam)
+        else:
+            print(f"[{cam}] Config file found. Loading calibration data...")
+            fs = cv2.FileStorage(config_path, cv2.FILE_STORAGE_READ)
+            if fs.isOpened():
+                cameraMatrix = fs.getNode("CameraMatrix").mat()
+                distCoeffs = fs.getNode("DistortionCoeffs").mat()
+                rvec = fs.getNode("RotationVector").mat()
+                tvec = fs.getNode("TranslationVector").mat()
+                fs.release()
+                full_calib[cam] = {"cameraMatrix": cameraMatrix,
+                                   "distCoeffs": distCoeffs,
+                                   "rvec": rvec,
+                                   "tvec": tvec}
+            else:
+                print(f"[{cam}] Failed to open {config_path}. Calibration needed.")
+                missing.append(cam)
+    if missing:
+        print("Running calibration for missing cameras:", missing)
+        intrinsics_results = calibrate_cameras(data_path, missing, num_frames=num_frames)
+        extrinsics_results = calibrate_all_cameras(data_path, missing, intrinsics_results, calib_video=calib_video)
+        for cam in missing:
+            if cam in extrinsics_results:
+                full_calib[cam] = extrinsics_results[cam]
+                xml_string = create_config_xml(full_calib[cam]["cameraMatrix"],
+                                               full_calib[cam]["distCoeffs"],
+                                               full_calib[cam]["rvec"],
+                                               full_calib[cam]["tvec"])
+                out_path = os.path.join(data_path, cam, "config.xml")
+                with open(out_path, "w") as f:
+                    f.write(xml_string)
+                print(f"[{cam}] Calibration data saved to {out_path}")
+            else:
+                print(f"[{cam}] Calibration failed. No config saved.")
+    return full_calib
 
 def generate_grid(width, depth):
     # Generates the floor grid locations

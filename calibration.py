@@ -185,3 +185,12 @@ def calibrate_camera(object_points, image_points, img_size):
         object_points, image_points, img_size, None, None
     )
     return cameraMatrix, distCoeffs, ret, rvecs, tvecs
+
+def reorder_corners(corners):
+    pts = np.array(corners)
+    sorted_by_y = pts[np.argsort(pts[:, 1])]
+    top = sorted_by_y[:2]
+    bottom = sorted_by_y[2:]
+    top_sorted = top[np.argsort(top[:, 0])]
+    bottom_sorted = bottom[np.argsort(bottom[:, 0])]
+    return [top_sorted[0], top_sorted[1], bottom_sorted[1], bottom_sorted[0]]

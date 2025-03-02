@@ -8,8 +8,7 @@ from engine.buffer.blurbuffer import BlurBuffer
 from engine.effect.bloom import Bloom
 from engine.camera import Camera
 from engine.config import config
-from assignment import set_voxel_positions, generate_grid, get_cam_positions, get_cam_rotation_matrices, calibrate_cameras
-# testing ------
+from assignment import set_voxel_positions, generate_grid, get_cam_positions, get_cam_rotation_matrices, run_calibration_interface
 import cv2
 import os
 import re
@@ -49,29 +48,21 @@ def draw_objs(obj, program, perspective, light_pos, texture, normal, specular, d
 
 def main():
     global hdrbuffer, blurbuffer, cube, window_width, window_height
-    # First, perform calibration
     data_path = "data"
     camera_folders = ["cam1", "cam2", "cam3", "cam4"]
-    # cam_calib = calibrate_cameras(data_path, camera_folders, num_frames=25)
-    # cam_calib is a dictionary containing each camera's calibration data
+    # Run the calibration interface (this will either load or generate the config.xml files)
+    full_calib = run_calibration_interface(data_path, camera_folders, num_frames=1, calib_video="checkerboard.avi")
+    if not full_calib:
+        print("Calibration failed for all cameras.")
+        return
 
-    # ------
-    # For testing only
     cam_calib = {}
-    
-    # Load camera parameters from XML files
     for cam in camera_folders:
-        cam_calib[cam] = {}
-        # Load camera matrix and distortion coefficients
-        file_path = os.path.join(data_path, cam, "config.xml")
-        fs = cv2.FileStorage(file_path, cv2.FILE_STORAGE_READ)
-        if not fs.isOpened():
-            print(f"Failed to open {file_path}")
-            continue
-        cam_calib[cam]["cameraMatrix"] = fs.getNode("CameraMatrix").mat()
-        cam_calib[cam]["distCoeffs"] = fs.getNode("DistortionCoeffs").mat()
-        fs.release()
-        print(f"Loaded calibration data for {cam}")
+        if cam in full_calib:
+            cam_calib[cam] = full_calib[cam]
+            print(f"Loaded calibration data for {cam}")
+        else:
+            print(f"No calibration data for {cam}, skipping.")
     
     # Continue with the rest of the initialization
     # ------
