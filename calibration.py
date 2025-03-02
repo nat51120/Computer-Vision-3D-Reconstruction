@@ -167,6 +167,18 @@ def interpolate_with_homography(corners_4, grid_size):
     warped = warped.reshape(num_rows, num_cols, 2)
     return warped
 
+# Function that determines whether the chessboard is placed vertically or horizontally
+def determine_grid_size(corners, horizontal_grid_size=11, vertical_grid_size=8):
+    tl = np.array(corners[0], dtype=np.float32)
+    tr = np.array(corners[1], dtype=np.float32)
+    bl = np.array(corners[3], dtype=np.float32)
+    width = np.linalg.norm(tr - tl)
+    height = np.linalg.norm(bl - tl)
+    if width >= height:
+        return (horizontal_grid_size, vertical_grid_size)
+    else:
+        return (vertical_grid_size, horizontal_grid_size)
+
 # Function that calibrates the cameras using openCV function
 def calibrate_camera(object_points, image_points, img_size):
     ret, cameraMatrix, distCoeffs, rvecs, tvecs = cv2.calibrateCamera(

@@ -6,16 +6,19 @@ from engine.buffer.texture import *
 from engine.buffer.hdrbuffer import HDRBuffer
 from engine.buffer.blurbuffer import BlurBuffer
 from engine.effect.bloom import Bloom
-from assignment import set_voxel_positions, generate_grid, get_cam_positions, get_cam_rotation_matrices
 from engine.camera import Camera
 from engine.config import config
 from assignment import set_voxel_positions, generate_grid, get_cam_positions, get_cam_rotation_matrices, calibrate_cameras
+# testing ------
+import cv2
+import os
+import re
+import numpy as np
 
 cube, hdrbuffer, blurbuffer, lastPosX, lastPosY = None, None, None, None, None
 firstTime = True
 window_width, window_height = config['window_width'], config['window_height']
 camera = Camera(glm.vec3(0, 100, 0), pitch=-90, yaw=0, speed=40)
-
 
 def draw_objs(obj, program, perspective, light_pos, texture, normal, specular, depth):
     program.use()
@@ -49,8 +52,29 @@ def main():
     # First, perform calibration
     data_path = "data"
     camera_folders = ["cam1", "cam2", "cam3", "cam4"]
-    cam_calib = calibrate_cameras(data_path, camera_folders, num_frames=25)
+    # cam_calib = calibrate_cameras(data_path, camera_folders, num_frames=25)
     # cam_calib is a dictionary containing each camera's calibration data
+
+    # ------
+    # For testing only
+    cam_calib = {}
+    
+    # Load camera parameters from XML files
+    for cam in camera_folders:
+        cam_calib[cam] = {}
+        # Load camera matrix and distortion coefficients
+        file_path = os.path.join(data_path, cam, "config.xml")
+        fs = cv2.FileStorage(file_path, cv2.FILE_STORAGE_READ)
+        if not fs.isOpened():
+            print(f"Failed to open {file_path}")
+            continue
+        cam_calib[cam]["cameraMatrix"] = fs.getNode("CameraMatrix").mat()
+        cam_calib[cam]["distCoeffs"] = fs.getNode("DistortionCoeffs").mat()
+        fs.release()
+        print(f"Loaded calibration data for {cam}")
+    
+    # Continue with the rest of the initialization
+    # ------
 
     if not glfw.init():
         print('Failed to initialize GLFW.')
@@ -130,6 +154,8 @@ def main():
 
     cam_positions, cam_colors = get_cam_positions()
     for c, cam_pos in enumerate(cam_positions):
+        print(f"Camera {c} position: {cam_pos}")
+        print(f"Camera {c} rotation matrix:\n{cam_rot_matrices[c]}")
         cam_shapes[c].set_multiple_positions([cam_pos], [cam_colors[c]])
 
     last_time = glfw.get_time()
