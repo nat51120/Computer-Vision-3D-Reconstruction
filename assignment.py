@@ -6,6 +6,8 @@ import os
 
 from calibration import extract_frames, get_manual_corners, interpolate_with_homography, determine_grid_size, calibrate_camera, inner_objp, reorder_corners, square_size
 from background_subtraction import build_background_model_mog2, get_foreground_mask
+from scipy.ndimage import label
+from scipy.spatial import cKDTree
 
 block_size = 1.0
 
@@ -241,17 +243,60 @@ def generate_grid(width, depth):
     for x in range(width):
         for z in range(depth):
             data.append([x*block_size - width/2, -block_size, z*block_size - depth/2])
-            colors.append([1.0, 1.0, 1.0] if (x+z) % 2 == 0 else [0, 0, 0])
+            colors.append([1.0, 1.0, 1.0] if (x+z) % 2 == 0 else [1, 1, 1])
     return data, colors
 
+def remove_small_clusters(active_voxels_mm, roi_origin, voxel_size, roi_extent, min_voxel_count=50):
+    """
+    Convert the list of active voxel positions (in mm) to a 3D occupancy grid,
+    perform connected component labeling, and remove clusters smaller than min_voxel_count.
+    Return the cleaned voxel positions in mm.
+    """
+    # Define grid shape based on the ROI
+    xs = np.arange(roi_origin[0], roi_origin[0] + roi_extent[0], voxel_size, dtype=np.float32)
+    ys = np.arange(roi_origin[1], roi_origin[1] + roi_extent[1], voxel_size, dtype=np.float32)
+    zs = np.arange(roi_origin[2], roi_origin[2] + roi_extent[2], voxel_size, dtype=np.float32)
+    grid_shape = (len(xs), len(ys), len(zs))
+    
+    occupancy = np.zeros(grid_shape, dtype=np.uint8)
+    
+    # For each active voxel, compute its index in the occupancy grid.
+    # Since the voxel positions come from the grid, the indices can be computed by:
+    # index = round((position - roi_origin) / voxel_size)
+    indices = np.rint((active_voxels_mm - roi_origin) / voxel_size).astype(int)
+    for idx in indices:
+        i, j, k = idx
+        if 0 <= i < grid_shape[0] and 0 <= j < grid_shape[1] and 0 <= k < grid_shape[2]:
+            occupancy[i, j, k] = 1
+
+    # Label connected components in the 3D occupancy grid
+    labeled, num_features = label(occupancy)
+    # Build a new occupancy grid that keeps only large clusters.
+    cleaned = np.zeros_like(occupancy)
+    for comp in range(1, num_features + 1):
+        comp_size = np.sum(labeled == comp)
+        if comp_size >= min_voxel_count:
+            cleaned[labeled == comp] = 1
+
+    # Convert the cleaned occupancy grid back to voxel positions (in mm)
+    kept_indices = np.argwhere(cleaned == 1)
+    # Each index corresponds to: position = roi_origin + index * voxel_size
+    cleaned_voxels = kept_indices.astype(np.float32) * voxel_size + roi_origin
+    return cleaned_voxels
 
 def set_voxel_positions(dummy_width, dummy_height, dummy_depth):
     """
-    Silhouette-based voxel carving in mm with multi-camera voting, then conversion to the 
-    same coordinate system as get_cam_positions.
+    Silhouette-based voxel carving in mm with multi-camera voting, noise removal,
+    and coloring of the voxel model with occlusion reasoning.
+    
+    Additional improvements:
+      - A step size (subsampling) is applied to the final set of active voxels,
+        to create a sparser (point cloud) effect.
+      - Voxels with no color samples are now given a fallback color (white)
+        instead of black.
     
     Steps:
-      1) Define an ROI in mm around the person (the "horse mask" subject).
+      1) Define an ROI in mm around the person.
       2) Generate a voxel grid in mm.
       3) For each camera (cam1, cam2, cam3, cam4):
              - Load calibration data.
@@ -259,18 +304,21 @@ def set_voxel_positions(dummy_width, dummy_height, dummy_depth):
              - Compute the foreground mask.
              - Project voxel centers onto the 2D image and increment a vote if the projection falls on foreground.
       4) Select voxels with votes >= threshold.
-      5) (Optional) For debugging, display the projection from cam1.
-      6) Convert the active voxel coordinates (mm) to viewer coordinates:
+      5) Run a 3D connected component analysis to remove small noisy clusters.
+      6) (Optional) Subsample the active voxels using a step size.
+      7) For each active voxel, determine its color via occlusion reasoning (using a per-camera z-buffer),
+         and average colors from all cameras where the voxel is visible.
+         If a voxel is not visible in any camera, assign it a fallback color (white).
+      8) Convert the active voxel coordinates from mm to viewer coordinates:
              - Multiply by 0.01 (mm → cm)
              - Flip Y and Z axes as in get_cam_positions.
              - Add a manual vertical offset if needed.
-      7) Return the transformed positions and colors.
+      9) Return the transformed positions and colors.
     """
     # --- ROI in mm (adjust to your scene) ---
-    # Example: Person is roughly between z = -1400 mm (head) and z = -500 mm (seat) etc.
-    roi_origin = np.array([-500, -900, -1400], dtype=np.float32)
+    roi_origin = np.array([-400, -800, -1400], dtype=np.float32)
     roi_extent = np.array([1000, 1400, 2000], dtype=np.float32)
-    voxel_size = 30.0  # mm per voxel (adjust for resolution vs. performance)
+    voxel_size = 10.0  # mm per voxel (adjust for resolution vs. performance)
     
     # Build the voxel grid in mm
     xs = np.arange(roi_origin[0], roi_origin[0] + roi_extent[0], voxel_size, dtype=np.float32)
@@ -283,13 +331,11 @@ def set_voxel_positions(dummy_width, dummy_height, dummy_depth):
     
     # Initialize vote counter for each voxel
     votes = np.zeros((N,), dtype=int)
-    
     data_path = "data"
     camera_folders = ["cam1", "cam2", "cam3", "cam4"]
     
-    # Loop over all cameras
+    # Loop over all cameras for multi-camera voting
     for cam in camera_folders:
-        # --- Load calibration data for current camera ---
         config_path = os.path.join(data_path, cam, "config.xml")
         fs = cv2.FileStorage(config_path, cv2.FILE_STORAGE_READ)
         if not fs.isOpened():
@@ -301,14 +347,12 @@ def set_voxel_positions(dummy_width, dummy_height, dummy_depth):
         tvec = fs.getNode("TranslationVector").mat()
         fs.release()
         
-        # --- Build background model ---
         bg_video_path = os.path.join(data_path, cam, "background.avi")
         bg_model = build_background_model_mog2(bg_video_path, num_frames=30)
         if bg_model is None:
             print(f"[VoxelCarving] Could not build BG model for {cam}")
             continue
         
-        # --- Grab one frame from the video ---
         video_path = os.path.join(data_path, cam, "video.avi")
         cap = cv2.VideoCapture(video_path)
         ret, frame = cap.read()
@@ -317,80 +361,137 @@ def set_voxel_positions(dummy_width, dummy_height, dummy_depth):
             print(f"[VoxelCarving] Could not read frame from {video_path}")
             continue
         
-        # --- Compute foreground mask ---
-        fg_mask = get_foreground_mask(frame, bg_model, fixed_thresh=(30, 30, 30), min_blob_area=500)
+        fg_mask = get_foreground_mask(frame, bg_model, fixed_thresh=(30,30,30), min_blob_area=500)
         h_img, w_img = fg_mask.shape
         
-        # --- Project voxel centers (in mm) onto the 2D image ---
         projected, _ = cv2.projectPoints(voxels_mm.astype(np.float32), rvec, tvec, cameraMatrix, distCoeffs)
-        projected = projected.reshape(-1, 2)  # shape: (N, 2)
+        projected = projected.reshape(-1, 2)
         proj_int = np.rint(projected).astype(int)
         
-        # --- For valid projections, add a vote if the pixel is foreground ---
-        valid = (proj_int[:, 0] >= 0) & (proj_int[:, 0] < w_img) & (proj_int[:, 1] >= 0) & (proj_int[:, 1] < h_img)
+        valid = (proj_int[:,0] >= 0) & (proj_int[:,0] < w_img) & (proj_int[:,1] >= 0) & (proj_int[:,1] < h_img)
         valid_indices = np.where(valid)[0]
         for idx in valid_indices:
             x_img, y_img = proj_int[idx]
             if fg_mask[y_img, x_img] == 255:
                 votes[idx] += 1
-                
         print(f"[VoxelCarving] Processed {cam}")
     
-    # Determine which voxels have enough votes (e.g., at least 3 of 4 cameras)
     vote_threshold = 4
     active_mask = votes >= vote_threshold
     active_voxels_mm = voxels_mm[active_mask]
     print(f"[VoxelCarving] Active voxels after voting: {active_voxels_mm.shape[0]} of {N}")
     
-    # --- (Optional) Debug Overlay for cam1 ---
-    # We'll display the voxel projections for cam1 only for visualization.
-    # cam_debug = "cam1"
-    # config_path = os.path.join(data_path, cam_debug, "config.xml")
-    # fs = cv2.FileStorage(config_path, cv2.FILE_STORAGE_READ)
-    # if fs.isOpened():
-    #     cameraMatrix = fs.getNode("CameraMatrix").mat()
-    #     distCoeffs = fs.getNode("DistortionCoeffs").mat()
-    #     rvec = fs.getNode("RotationVector").mat()
-    #     tvec = fs.getNode("TranslationVector").mat()
-    #     fs.release()
-    #     video_path = os.path.join(data_path, cam_debug, "video.avi")
-    #     cap = cv2.VideoCapture(video_path)
-    #     ret, frame = cap.read()
-    #     cap.release()
-    #     bg_video_path = os.path.join(data_path, cam_debug, "background.avi")
-    #     bg_model = build_background_model_mog2(bg_video_path, num_frames=30)
-    #     fg_mask = get_foreground_mask(frame, bg_model, fixed_thresh=(30, 30, 30), min_blob_area=500)
-    #     vis_img = cv2.cvtColor(fg_mask, cv2.COLOR_GRAY2BGR)
-    #     # Sample a subset of active voxels for overlay
-    #     if active_voxels_mm.shape[0] > 0:
-    #         sample_rate = max(1, active_voxels_mm.shape[0] // 200)
-    #         sample_voxels = active_voxels_mm[::sample_rate]
-    #         sample_proj, _ = cv2.projectPoints(sample_voxels.astype(np.float32), rvec, tvec, cameraMatrix, distCoeffs)
-    #         sample_proj = sample_proj.reshape(-1, 2).astype(int)
-    #         for (x, y) in sample_proj:
-    #             cv2.circle(vis_img, (x, y), 2, (0, 0, 255), -1)
-    #     cv2.imshow("Cam1 Debug: Voxel Projections", vis_img)
-    #     cv2.waitKey(0)
-    #     cv2.destroyWindow("Cam1 Debug: Voxel Projections")
+    # --- Remove small noisy clusters using connected component analysis ---
+    active_voxels_mm = remove_small_clusters(active_voxels_mm, roi_origin, voxel_size, roi_extent, min_voxel_count=50)
+    print(f"[VoxelCarving] Active voxels after noise removal: {active_voxels_mm.shape[0]}")
+    
+    # --- Optional: Subsample (step size) the active voxels for a sparser point cloud ---
+    step_size = 1  # Use every 2nd voxel; increase to make it sparser.
+    active_voxels_mm = active_voxels_mm[::step_size]
+    print(f"[VoxelCarving] Active voxels after subsampling: {active_voxels_mm.shape[0]}")
+    
+    
+    # --- Coloring: Determine Voxel Colors with Occlusion Reasoning ---
+    voxel_colors = np.zeros((active_voxels_mm.shape[0], 3), dtype=np.float32)
+    visibility_counts = np.zeros((active_voxels_mm.shape[0],), dtype=np.int32)
+
+    for cam in camera_folders:
+        config_path = os.path.join(data_path, cam, "config.xml")
+        fs = cv2.FileStorage(config_path, cv2.FILE_STORAGE_READ)
+        if not fs.isOpened():
+            print(f"Could not open {config_path}")
+            continue
+        cameraMatrix = fs.getNode("CameraMatrix").mat()
+        distCoeffs = fs.getNode("DistortionCoeffs").mat()
+        rvec = fs.getNode("RotationVector").mat()
+        tvec = fs.getNode("TranslationVector").mat()
+        fs.release()
+        
+        video_path = os.path.join(data_path, cam, "video.avi")
+        cap = cv2.VideoCapture(video_path)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            print(f"Could not read frame from {video_path}")
+            continue
+        frame = frame.astype(np.float32)
+        h_img, w_img, _ = frame.shape
+        
+        projected, _ = cv2.projectPoints(active_voxels_mm.astype(np.float32), rvec, tvec, cameraMatrix, distCoeffs)
+        projected = projected.reshape(-1,2)
+        proj_int = np.rint(projected).astype(int)
+        
+        R, _ = cv2.Rodrigues(rvec)
+        X_cam = (R @ active_voxels_mm.T + tvec).T  # shape: (num_active, 3)
+        depths = X_cam[:, 2]  # Depth values in mm
+        
+        # Build a simple depth map (z-buffer) for this camera:
+        depth_map = np.full((h_img, w_img), np.inf, dtype=np.float32)
+        for i, (p, d) in enumerate(zip(proj_int, depths)):
+            x, y = p
+            if 0 <= x < w_img and 0 <= y < h_img:
+                if d < depth_map[y, x]:
+                    depth_map[y, x] = d
+        
+        tolerance = 5.0  # mm tolerance for occlusion
+        for i, (p, d) in enumerate(zip(proj_int, depths)):
+            x, y = p
+            if 0 <= x < w_img and 0 <= y < h_img:
+                if abs(d - depth_map[y, x]) < tolerance:
+                    color = frame[y, x, :]  # BGR
+                    voxel_colors[i] += color
+                    visibility_counts[i] += 1
+        print(f"[Coloring] Processed {cam}")
+
+    # For voxels that did not receive any color sample, fill in using neighboring voxels.
+    colored_idx = np.where(visibility_counts > 0)[0]
+    if colored_idx.size > 0:
+        colored_positions = active_voxels_mm[colored_idx]
+        colored_colors = voxel_colors[colored_idx]
+        tree = cKDTree(colored_positions)
+        
+        uncolored_idx = np.where(visibility_counts == 0)[0]
+        for i in uncolored_idx:
+            pos = active_voxels_mm[i]
+            # Try to find neighbors within a radius (e.g., 2*voxel_size)
+            neighbors = tree.query_ball_point(pos, r=2 * voxel_size)
+            if len(neighbors) > 0:
+                avg_color = np.mean(colored_colors[neighbors], axis=0)
+                voxel_colors[i] = avg_color
+                visibility_counts[i] = 1
+            else:
+                # If no neighbor within the radius, use the nearest neighbor.
+                distance, neighbor_index = tree.query(pos)
+                voxel_colors[i] = colored_colors[neighbor_index]
+                visibility_counts[i] = 1
+    else:
+        voxel_colors[:] = 255
+
+    # Average the colors for each voxel (for those with direct samples, this divides by the count)
+    for i in range(voxel_colors.shape[0]):
+        if visibility_counts[i] > 0:
+            voxel_colors[i] /= visibility_counts[i]
+        else:
+            voxel_colors[i] = [255, 255, 255]  # Fallback to white
+
+    # Normalize colors to [0,1]
+    voxel_colors /= 255.0
+
+
     
     # --- Convert active voxel positions to viewer coordinates ---
-    # The conversion used in get_cam_positions is:
-    #   Xviewer = Xmm * 0.01
-    #   Yviewer = -Zmm * 0.01
-    #   Zviewer = Ymm * 0.01
-    # Optionally, add a manual offset in Y if needed.
     positions_viewer = []
-    scale_factor = 0.01  # mm → cm
-    viewer_y_offset = 2  # Adjust this offset (in cm) to align the model with the floor
-
+    scale_factor = 0.01  # mm -> cm
+    viewer_y_offset = 2  # cm offset
     for (Xmm, Ymm, Zmm) in active_voxels_mm:
         Xv = Xmm * scale_factor
         Yv = -Zmm * scale_factor + viewer_y_offset
         Zv = Ymm * scale_factor
         positions_viewer.append([Xv, Yv, Zv])
-
-    colors = [[1.0, 1.0, 1.0] for _ in range(len(positions_viewer))]
+    
+    colors = voxel_colors.tolist()
     return positions_viewer, colors
+
 
 
 
