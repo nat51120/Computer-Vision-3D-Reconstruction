@@ -245,105 +245,155 @@ def generate_grid(width, depth):
     return data, colors
 
 
-def set_voxel_positions(width, height, depth):
-    # Performs voxel reconstruction based on foreground masks from multiple camera views.
+def set_voxel_positions(dummy_width, dummy_height, dummy_depth):
+    """
+    Silhouette-based voxel carving in mm with multi-camera voting, then conversion to the 
+    same coordinate system as get_cam_positions.
+    
+    Steps:
+      1) Define an ROI in mm around the person (the "horse mask" subject).
+      2) Generate a voxel grid in mm.
+      3) For each camera (cam1, cam2, cam3, cam4):
+             - Load calibration data.
+             - Build background model and grab one frame.
+             - Compute the foreground mask.
+             - Project voxel centers onto the 2D image and increment a vote if the projection falls on foreground.
+      4) Select voxels with votes >= threshold.
+      5) (Optional) For debugging, display the projection from cam1.
+      6) Convert the active voxel coordinates (mm) to viewer coordinates:
+             - Multiply by 0.01 (mm → cm)
+             - Flip Y and Z axes as in get_cam_positions.
+             - Add a manual vertical offset if needed.
+      7) Return the transformed positions and colors.
+    """
+    # --- ROI in mm (adjust to your scene) ---
+    # Example: Person is roughly between z = -1400 mm (head) and z = -500 mm (seat) etc.
+    roi_origin = np.array([-500, -900, -1400], dtype=np.float32)
+    roi_extent = np.array([1000, 1400, 2000], dtype=np.float32)
+    voxel_size = 30.0  # mm per voxel (adjust for resolution vs. performance)
+    
+    # Build the voxel grid in mm
+    xs = np.arange(roi_origin[0], roi_origin[0] + roi_extent[0], voxel_size, dtype=np.float32)
+    ys = np.arange(roi_origin[1], roi_origin[1] + roi_extent[1], voxel_size, dtype=np.float32)
+    zs = np.arange(roi_origin[2], roi_origin[2] + roi_extent[2], voxel_size, dtype=np.float32)
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+    voxels_mm = np.stack((X.flatten(), Y.flatten(), Z.flatten()), axis=-1)  # shape: (N, 3)
+    N = voxels_mm.shape[0]
+    print(f"[VoxelCarving] ROI-based grid in mm: {N} voxels")
+    
+    # Initialize vote counter for each voxel
+    votes = np.zeros((N,), dtype=int)
+    
     data_path = "data"
     camera_folders = ["cam1", "cam2", "cam3", "cam4"]
-    cam_params = {}
     
-    # Load camera parameters from XML files
+    # Loop over all cameras
     for cam in camera_folders:
-        cam_params[cam] = {}
-        
-        # Load intrinsics and extrensics
-        fs = cv2.FileStorage(os.path.join(data_path, cam, "config.xml"), cv2.FILE_STORAGE_READ)
+        # --- Load calibration data for current camera ---
+        config_path = os.path.join(data_path, cam, "config.xml")
+        fs = cv2.FileStorage(config_path, cv2.FILE_STORAGE_READ)
         if not fs.isOpened():
-            print(f"Failed to open config.xml for {cam}")
+            print(f"Could not open {config_path}")
             continue
-        cam_params[cam]["cameraMatrix"] = fs.getNode("CameraMatrix").mat()
-        cam_params[cam]["distCoeffs"] = fs.getNode("DistortionCoeffs").mat()
-        cam_params[cam]["rvec"] = fs.getNode("RotationVector").mat()
-        cam_params[cam]["tvec"] = fs.getNode("TranslationVector").mat()
+        cameraMatrix = fs.getNode("CameraMatrix").mat()
+        distCoeffs = fs.getNode("DistortionCoeffs").mat()
+        rvec = fs.getNode("RotationVector").mat()
+        tvec = fs.getNode("TranslationVector").mat()
         fs.release()
-        print(f"Successfully loaded config for {cam}")
-            
-    # Build background models for each camera
-    bg_models = {}
-    for cam in camera_folders:
+        
+        # --- Build background model ---
         bg_video_path = os.path.join(data_path, cam, "background.avi")
-        bg_models[cam] = build_background_model_mog2(bg_video_path)
-    
-    # Get a frame from each camera for foreground extraction
-    foreground_masks = {}
-    for cam in camera_folders:
+        bg_model = build_background_model_mog2(bg_video_path, num_frames=30)
+        if bg_model is None:
+            print(f"[VoxelCarving] Could not build BG model for {cam}")
+            continue
+        
+        # --- Grab one frame from the video ---
         video_path = os.path.join(data_path, cam, "video.avi")
         cap = cv2.VideoCapture(video_path)
         ret, frame = cap.read()
         cap.release()
+        if not ret:
+            print(f"[VoxelCarving] Could not read frame from {video_path}")
+            continue
         
-        if ret:
-            # Get foreground mask using background subtraction
-            foreground_masks[cam] = get_foreground_mask(frame, bg_models[cam])
-            print(f"Foreground mask for {cam}: min={np.min(foreground_masks[cam])}, max={np.max(foreground_masks[cam])}")
-        else:
-            print(f"Failed to read frame from {video_path}")
-            foreground_masks[cam] = None
-    
-    data = []
-    colors = []
-    
-    half_width = width / 2
-    half_depth = depth / 2
-    
-    voxel_count = 0
-    
-    for x in range(width):
-        for y in range(height):
-            for z in range(depth):
-                # Calculate world coordinates of the voxel
-                world_x = x * block_size - half_width
-                world_y = y * block_size
-                world_z = z * block_size - half_depth
+        # --- Compute foreground mask ---
+        fg_mask = get_foreground_mask(frame, bg_model, fixed_thresh=(30, 30, 30), min_blob_area=500)
+        h_img, w_img = fg_mask.shape
+        
+        # --- Project voxel centers (in mm) onto the 2D image ---
+        projected, _ = cv2.projectPoints(voxels_mm.astype(np.float32), rvec, tvec, cameraMatrix, distCoeffs)
+        projected = projected.reshape(-1, 2)  # shape: (N, 2)
+        proj_int = np.rint(projected).astype(int)
+        
+        # --- For valid projections, add a vote if the pixel is foreground ---
+        valid = (proj_int[:, 0] >= 0) & (proj_int[:, 0] < w_img) & (proj_int[:, 1] >= 0) & (proj_int[:, 1] < h_img)
+        valid_indices = np.where(valid)[0]
+        for idx in valid_indices:
+            x_img, y_img = proj_int[idx]
+            if fg_mask[y_img, x_img] == 255:
+                votes[idx] += 1
                 
-                visible_count = 0
-                
-                for cam in camera_folders:
-                    if foreground_masks[cam] is None:
-                        continue
-                    
-                    # Project 3D point to 2D image coordinates
-                    point_3d = np.array([[world_x, world_y, world_z]], dtype=np.float32)
-                    img_points, _ = cv2.projectPoints(
-                        point_3d, 
-                        cam_params[cam]["rvec"], 
-                        cam_params[cam]["tvec"], 
-                        cam_params[cam]["cameraMatrix"], 
-                        cam_params[cam]["distCoeffs"]
-                    )
-                    
-                    px = int(round(img_points[0][0][0]))
-                    py = int(round(img_points[0][0][1]))
-                    
-                    # Check if the projected point is within image bounds
-                    h, w = foreground_masks[cam].shape[:2]
-                    if 0 <= px < w and 0 <= py < h:
-                        if foreground_masks[cam][py, px] > 0:  # Foreground
-                            visible_count += 1
-                            break
-                
-                # If the voxel is visible in at least one camera view, add it to the result
-                if visible_count > 0:
-                    data.append([world_x, world_y, world_z])
-                    colors.append([x / width, y / height, z / depth])
-                    voxel_count += 1
+        print(f"[VoxelCarving] Processed {cam}")
     
-    print(f"Generated {voxel_count} voxels")
+    # Determine which voxels have enough votes (e.g., at least 3 of 4 cameras)
+    vote_threshold = 4
+    active_mask = votes >= vote_threshold
+    active_voxels_mm = voxels_mm[active_mask]
+    print(f"[VoxelCarving] Active voxels after voting: {active_voxels_mm.shape[0]} of {N}")
     
-    # If no voxels were found
-    if len(data) == 0:
-        print("No voxels found")
+    # --- (Optional) Debug Overlay for cam1 ---
+    # We'll display the voxel projections for cam1 only for visualization.
+    # cam_debug = "cam1"
+    # config_path = os.path.join(data_path, cam_debug, "config.xml")
+    # fs = cv2.FileStorage(config_path, cv2.FILE_STORAGE_READ)
+    # if fs.isOpened():
+    #     cameraMatrix = fs.getNode("CameraMatrix").mat()
+    #     distCoeffs = fs.getNode("DistortionCoeffs").mat()
+    #     rvec = fs.getNode("RotationVector").mat()
+    #     tvec = fs.getNode("TranslationVector").mat()
+    #     fs.release()
+    #     video_path = os.path.join(data_path, cam_debug, "video.avi")
+    #     cap = cv2.VideoCapture(video_path)
+    #     ret, frame = cap.read()
+    #     cap.release()
+    #     bg_video_path = os.path.join(data_path, cam_debug, "background.avi")
+    #     bg_model = build_background_model_mog2(bg_video_path, num_frames=30)
+    #     fg_mask = get_foreground_mask(frame, bg_model, fixed_thresh=(30, 30, 30), min_blob_area=500)
+    #     vis_img = cv2.cvtColor(fg_mask, cv2.COLOR_GRAY2BGR)
+    #     # Sample a subset of active voxels for overlay
+    #     if active_voxels_mm.shape[0] > 0:
+    #         sample_rate = max(1, active_voxels_mm.shape[0] // 200)
+    #         sample_voxels = active_voxels_mm[::sample_rate]
+    #         sample_proj, _ = cv2.projectPoints(sample_voxels.astype(np.float32), rvec, tvec, cameraMatrix, distCoeffs)
+    #         sample_proj = sample_proj.reshape(-1, 2).astype(int)
+    #         for (x, y) in sample_proj:
+    #             cv2.circle(vis_img, (x, y), 2, (0, 0, 255), -1)
+    #     cv2.imshow("Cam1 Debug: Voxel Projections", vis_img)
+    #     cv2.waitKey(0)
+    #     cv2.destroyWindow("Cam1 Debug: Voxel Projections")
     
-    return data, colors
+    # --- Convert active voxel positions to viewer coordinates ---
+    # The conversion used in get_cam_positions is:
+    #   Xviewer = Xmm * 0.01
+    #   Yviewer = -Zmm * 0.01
+    #   Zviewer = Ymm * 0.01
+    # Optionally, add a manual offset in Y if needed.
+    positions_viewer = []
+    scale_factor = 0.01  # mm → cm
+    viewer_y_offset = 2  # Adjust this offset (in cm) to align the model with the floor
+
+    for (Xmm, Ymm, Zmm) in active_voxels_mm:
+        Xv = Xmm * scale_factor
+        Yv = -Zmm * scale_factor + viewer_y_offset
+        Zv = Ymm * scale_factor
+        positions_viewer.append([Xv, Yv, Zv])
+
+    colors = [[1.0, 1.0, 1.0] for _ in range(len(positions_viewer))]
+    return positions_viewer, colors
+
+
+
 
 
 def get_cam_positions():
@@ -374,12 +424,17 @@ def get_cam_positions():
             camera_position = -np.matmul(R.T, tvec).flatten()
             
             # Scale down the positions to fit in the visualization space
-            scale_factor = 0.1
+            # Divide by 100 to convert from centimeters to meters or to scale appropriately
+            scale_factor = 0.01  # 1/100
             
+            # OpenCV to OpenGL coordinate conversion:
+            # OpenCV: Y down, Z forward
+            # OpenGL: Y up, Z backward
+            # Need to flip Y and Z axes
             scaled_position = [
                 camera_position[0] * scale_factor,
-                camera_position[1] * scale_factor,
-                camera_position[2] * scale_factor
+                -camera_position[2] * scale_factor,  # Flip Y axis
+                camera_position[1] * scale_factor   # Flip Z axis
             ]
             
             cam_positions.append(scaled_position)
@@ -414,10 +469,19 @@ def get_cam_rotation_matrices():
             fs.release()
             rot_mat, _ = cv2.Rodrigues(rvec)
             
+            # Convert OpenCV rotation matrix to OpenGL rotation matrix
+            # Need to flip Y and Z axes
+            flip_mat = np.array([
+                [1, 0, 0],
+                [0, 1, 0],  # Flip Y axis
+                [0, 0, 1]   # Flip Z axis
+            ])
+            rot_mat_gl = np.matmul(flip_mat, rot_mat)
+            
             rot_mat_4x4 = glm.mat4(1)
             for i in range(3):
                 for j in range(3):
-                    rot_mat_4x4[i][j] = rot_mat[i, j]
+                    rot_mat_4x4[i][j] = rot_mat_gl[i, j]
             
             cam_rotations.append(rot_mat_4x4)
             print(f"Loaded camera rotation for {cam}: {rvec.flatten()}")
