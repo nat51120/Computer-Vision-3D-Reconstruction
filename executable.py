@@ -8,7 +8,7 @@ from engine.buffer.blurbuffer import BlurBuffer
 from engine.effect.bloom import Bloom
 from engine.camera import Camera
 from engine.config import config
-from assignment import set_voxel_positions, generate_grid, get_cam_positions, get_cam_rotation_matrices, run_calibration_interface
+from assignment import set_voxel_positions, generate_grid, get_cam_positions, get_cam_rotation_matrices, run_calibration_interface, create_surface_mesh
 import cv2
 import os
 import re
@@ -209,6 +209,8 @@ def key_callback(window, key, scancode, action, mods):
         global cube
         positions, colors = set_voxel_positions(config['world_width'], config['world_height'], config['world_width'])
         cube.set_multiple_positions(positions, colors)
+    if key == glfw.KEY_H and action == glfw.PRESS:
+        create_surface_mesh()
 
 
 def mouse_move(win, pos_x, pos_y):
